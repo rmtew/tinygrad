@@ -134,6 +134,17 @@ class DLL(ctypes.CDLL):
   _loaded_: set[str] = set()
 
   @staticmethod
+  def _win_cuda_paths() -> list[str]:
+    """Find CUDA toolkit bin directories on Windows (e.g. C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/bin/x64)."""
+    import glob as _glob
+    paths = []
+    for d in _glob.glob("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v*/bin/x64"):
+      paths.append(d)
+    for d in _glob.glob("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v*/bin"):
+      paths.append(d)
+    return paths
+
+  @staticmethod
   def findlib(nm:str, paths:list[str], extra_paths=[]):
     if nm == 'libc' and OSX: return '/usr/lib/libc.dylib'
     if pathlib.Path(path:=getenv(nm.replace('-', '_').upper()+"_PATH", '')).is_file(): return path
@@ -141,14 +152,26 @@ class DLL(ctypes.CDLL):
       libpaths = {"posix": ["/usr/lib64", "/usr/lib", "/usr/local/lib"], "nt": os.environ['PATH'].split(os.pathsep),
                   "darwin": ["/opt/homebrew/lib", f"/System/Library/Frameworks/{p}.framework", f"/System/Library/PrivateFrameworks/{p}.framework"],
                   'linux': ['/lib', '/lib64', f"/lib/{sysconfig.get_config_var('MULTIARCH')}", "/usr/lib/wsl/lib/"]}
+      # On Windows, add CUDA toolkit paths for GPU library discovery
+      if WIN: libpaths.setdefault('nt', []).extend(DLL._win_cuda_paths())
       if (pth:=pathlib.Path(p)).is_absolute():
         if pth.is_file(): return p
         else: continue
       for pre in (pathlib.Path(pre) for pre in ([path] if path else []) + libpaths.get(os.name, []) + libpaths.get(sys.platform, []) + extra_paths):
         if not pre.is_dir(): continue
-        if WIN or OSX:
-          for base in ([f"lib{p}.dylib", f"{p}.dylib", str(p)] if OSX else [f"{p}.dll"]):
-            if (l:=pre / base).is_file() or (OSX and 'framework' in str(l) and l.is_symlink()): return str(l)
+        if WIN:
+          # Exact match first: {p}.dll
+          if (l:=pre / f"{p}.dll").is_file(): return str(l)
+          # Windows CUDA libraries use versioned names (e.g. nvrtc64_130_0.dll, nvJitLink_130_0.dll, nvcuda.dll)
+          # Try common prefixes: nv{p}.dll, {p}64_*.dll, {p}_*.dll
+          for l in sorted(pre.iterdir(), reverse=True):  # reverse sort to prefer newest version
+            if not l.is_file() or l.suffix.lower() != '.dll': continue
+            ln = l.stem.lower()
+            pl = p.lower()
+            if ln == f"nv{pl}" or ln.startswith(f"{pl}64_") or ln.startswith(f"{pl}_"): return str(l)
+        elif OSX:
+          for base in [f"lib{p}.dylib", f"{p}.dylib", str(p)]:
+            if (l:=pre / base).is_file() or ('framework' in str(l) and l.is_symlink()): return str(l)
         else:
           for l in (l for l in pre.iterdir() if l.is_file() and re.fullmatch(f"lib{p}\\.so\\.?[0-9]*", l.name)):
             # filter out linker scripts
