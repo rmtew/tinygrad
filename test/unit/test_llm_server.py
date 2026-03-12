@@ -108,5 +108,69 @@ class TestTransformerGenerate(unittest.TestCase):
     # 4 tokens, chunk_size=4 -> 1 prefill chunk
     self.assertEqual(get_prefill_flags(list(range(4)), 4), [True, False, False])
 
+  def test_qwen35_two_prompts_schedule_cache(self):
+    """Qwen3.5 hybrid model (SSM + attention blocks) should be fully symbolic — no schedule cache growth."""
+    from tinygrad.apps.llm import Transformer, TransformerBlock
+    dim, hidden_dim, norm_eps, max_context = 64, 128, 1e-5, 64
+    n_heads, n_kv_heads, head_dim, rope_theta = 2, 2, 32, 10000.0
+    n_v_heads, n_k_heads, ssm_head_dim, conv_kernel = 4, 4, 16, 4
+    # pattern: 3 GatedDeltaNet + 1 TransformerBlock (full_attention_interval=4)
+    blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context,
+                            n_v_heads=n_v_heads, ssm_n_k_heads=n_k_heads, ssm_head_dim=ssm_head_dim, conv_kernel=conv_kernel) for _ in range(3)]
+    blk.append(TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, attn_gate=True))
+    model = Transformer(num_blocks=4, dim=dim, hidden_dim=hidden_dim, n_heads=n_heads, n_kv_heads=n_kv_heads,
+                        norm_eps=norm_eps, vocab_size=100, head_dim=head_dim, rope_theta=rope_theta, max_context=max_context, blk=blk)
+
+    # first two prompts warm up the JIT
+    gen = model.generate(list(range(1, 6)))
+    for _ in range(3): next(gen)
+    gen = model.generate(list(range(10, 20)))
+    for _ in range(3): next(gen)
+    cache_size_after_warmup = len(schedule_cache)
+
+    # third prompt should reuse — no new schedule cache entries
+    gen = model.generate(list(range(20, 30)))
+    for _ in range(3): next(gen)
+    self.assertEqual(cache_size_after_warmup, len(schedule_cache),
+      f"third prompt added {len(schedule_cache) - cache_size_after_warmup} new schedule cache entries (expected 0)")
+
+class TestApplyRope(unittest.TestCase):
+  def test_partial_rope(self):
+    """With rope_dim < head_dim, the non-rotated suffix should pass through unchanged."""
+    from tinygrad.apps.llm import apply_rope, precompute_freqs_cis
+    freqs = precompute_freqs_cis(16, 10, 10000.0)  # dim=16, only rotate first 16 of 32
+    x = Tensor.randn(1, 1, 2, 32)
+    result = apply_rope(x, freqs[:2], rope_dim=16)
+    # last 16 dims unchanged
+    self.assertEqual(result.shape, x.shape)
+    self.assertEqual(result[..., 16:].tolist(), x[..., 16:].tolist())
+    # first 16 dims are rotated (should differ from input)
+    self.assertNotEqual(result[..., :16].tolist(), x[..., :16].tolist())
+
+class TestSSMGatedDeltaNet(unittest.TestCase):
+  def test_grouped_query_forward(self):
+    """GatedDeltaNet block with n_v_heads != n_k_heads should produce correct output shape."""
+    from tinygrad.apps.llm import TransformerBlock
+    blk = TransformerBlock(dim=64, hidden_dim=128, n_heads=2, n_kv_heads=2, norm_eps=1e-5, head_dim=32, rope_theta=10000.0,
+                           n_v_heads=4, ssm_n_k_heads=2, ssm_head_dim=16, conv_kernel=4)
+    x = Tensor.randn(1, 1, 64)  # (B=1, T=1, D=64)
+    out = blk(x, start_pos=0)
+    self.assertEqual(out.shape, (1, 1, 64))
+
+  def test_generate_determinism(self):
+    """Two identical generate() calls on a qwen35 model should produce the same tokens (state reset works)."""
+    from tinygrad.apps.llm import Transformer, TransformerBlock
+    dim, hidden_dim, norm_eps, max_context = 64, 128, 1e-5, 64
+    blk = [TransformerBlock(dim, hidden_dim, n_heads=2, n_kv_heads=2, norm_eps=norm_eps, head_dim=32, rope_theta=10000.0, max_context=max_context,
+                            n_v_heads=4, ssm_n_k_heads=4, ssm_head_dim=16, conv_kernel=4) for _ in range(3)]
+    blk.append(TransformerBlock(dim, hidden_dim, n_heads=2, n_kv_heads=2, norm_eps=norm_eps, head_dim=32,
+                                rope_theta=10000.0, max_context=max_context, attn_gate=True))
+    model = Transformer(num_blocks=4, dim=dim, hidden_dim=hidden_dim, n_heads=2, n_kv_heads=2,
+                        norm_eps=norm_eps, vocab_size=100, head_dim=32, rope_theta=10000.0, max_context=max_context, blk=blk)
+    prompt = list(range(1, 6))
+    out1 = [next(model.generate(list(prompt))) for _ in range(3)]
+    out2 = [next(model.generate(list(prompt))) for _ in range(3)]
+    self.assertEqual(out1, out2, f"generate() not deterministic across calls: {out1} != {out2}")
+
 if __name__ == '__main__':
   unittest.main()

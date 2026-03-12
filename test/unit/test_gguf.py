@@ -106,7 +106,10 @@ class TestGGUF(unittest.TestCase):
 
     for rt in reader.tensors:
       ref = dequantize(rt.data, rt.tensor_type)
-      np.testing.assert_equal(tensors[rt.name].numpy(), ref.reshape(tensors[rt.name].shape))
+      t = tensors[rt.name]
+      if t.dtype.name == 'unsigned char' and len(t.shape) == 2:
+        t = ggml_data_to_tensor(t.flatten(), ref.size, rt.tensor_type.value)
+      np.testing.assert_equal(t.numpy(), ref.reshape(t.shape))
 
     for k, f in reader.fields.items():
       if k.startswith("GGUF."): continue  # skip file header keys (version, tensor_count, kv_count)
@@ -145,17 +148,84 @@ class TestGGUFGEMV(unittest.TestCase):
     buf += q_data.tobytes()
 
     _, tensors = gguf_load(Tensor(np.frombuffer(buf, dtype=np.uint8)).to(None))
+    w = tensors["weight"]
+    if w.dtype.name == 'unsigned char' and len(w.shape) == 2:
+      w = ggml_data_to_tensor(w.flatten(), rows * cols, qtype.value).reshape(rows, cols)
 
     x = rng.standard_normal(cols).astype(np.float32)
-    np.testing.assert_allclose((tensors["weight"] @ Tensor(x)).numpy(), ref @ x, atol=1e-2, rtol=1e-2)
-    np.testing.assert_equal(tensors["weight"].numpy(), ref)
-    assert np.isfinite(ref).all() and np.isfinite(tensors["weight"].numpy()).all(), f"{qtype.name} has NaN/Inf"
+    np.testing.assert_allclose((w @ Tensor(x)).numpy(), ref @ x, atol=1e-2, rtol=1e-2)
+    np.testing.assert_equal(w.numpy(), ref)
+    assert np.isfinite(ref).all() and np.isfinite(w.numpy()).all(), f"{qtype.name} has NaN/Inf"
 
   def test_gguf_gemv_q8_0(self): self._test_gguf_gemv(GGMLQuantizationType.Q8_0)
   def test_gguf_gemv_q4_k(self): self._test_gguf_gemv(GGMLQuantizationType.Q4_K)
   def test_gguf_gemv_q5_k(self): self._test_gguf_gemv(GGMLQuantizationType.Q5_K)
   def test_gguf_gemv_q6_k(self): self._test_gguf_gemv(GGMLQuantizationType.Q6_K)
   def test_gguf_gemv_mxfp4(self): self._test_gguf_gemv(GGMLQuantizationType.MXFP4)
+
+@unittest.skipIf(any(not is_dtype_supported(t) for t in [ dtypes.uint8, dtypes.half ]), "Backend must support uint8 and half")
+class TestQuantizedLinear(unittest.TestCase):
+  # (qtype, block_elements, block_bytes, scale_bytes, scale_offset)
+  _qtypes = [(GGMLQuantizationType.Q8_0, 32, 34, 2, 0), (GGMLQuantizationType.Q4_K, 256, 144, 4, 0),
+             (GGMLQuantizationType.Q5_K, 256, 176, 4, 0), (GGMLQuantizationType.Q6_K, 256, 210, 2, 208)]
+
+  def _make_blocks(self, qtype, block_elements, block_bytes, scale_bytes, scale_offset, rows=512, cols=256):
+    rng = np.random.default_rng(42)
+    n_blocks = rows * cols // block_elements
+    q_data = rng.integers(0, 256, size=n_blocks * block_bytes, dtype=np.uint8).reshape(n_blocks, block_bytes)
+    # ensure valid fp16 scales (random bytes can produce NaN)
+    scales = np.float16(rng.standard_normal(n_blocks * (scale_bytes // 2))).view(np.uint8).reshape(n_blocks, scale_bytes)
+    q_data[:, scale_offset:scale_offset + scale_bytes] = scales
+    return q_data, rows, cols
+
+  def test_dequantize_matches_ggml(self):
+    """QuantizedLinear._dequantize() must match ggml reference for all supported quant types."""
+    from tinygrad.apps.llm import QuantizedLinear
+    for qtype, bel, bby, sb, so in self._qtypes:
+      with self.subTest(qtype=qtype.name):
+        q_data, rows, cols = self._make_blocks(qtype, bel, bby, sb, so)
+        ref = dequantize(q_data.flatten(), qtype).reshape(rows, cols).astype(np.float16)
+        ql = QuantizedLinear(Tensor(q_data), rows, cols, qtype.value)
+        np.testing.assert_equal(ql._dequantize().numpy(), ref)
+
+  def test_gemv_matches_linear(self):
+    """QuantizedLinear matmul must match dequantized reference for all supported quant types."""
+    from tinygrad.apps.llm import QuantizedLinear
+    for qtype, bel, bby, sb, so in self._qtypes:
+      with self.subTest(qtype=qtype.name):
+        q_data, rows, cols = self._make_blocks(qtype, bel, bby, sb, so)
+        ref_weights = dequantize(q_data.flatten(), qtype).reshape(rows, cols).astype(np.float16)
+        x = np.random.default_rng(42).standard_normal(cols).astype(np.float32)
+        ql = QuantizedLinear(Tensor(q_data), rows, cols, qtype.value)
+        np.testing.assert_allclose(ql(Tensor(x)).numpy(), (Tensor(x) @ Tensor(ref_weights).transpose()).numpy(), atol=1e-1, rtol=1e-1)
+
+  def test_auto_detect_type(self):
+    """QuantizedLinear infers ggml_type from block size when not specified."""
+    from tinygrad.apps.llm import QuantizedLinear
+    for qtype, bel, bby, sb, so in self._qtypes:
+      with self.subTest(qtype=qtype.name):
+        q_data, rows, cols = self._make_blocks(qtype, bel, bby, sb, so)
+        ql = QuantizedLinear(Tensor(q_data), rows, cols)
+        self.assertEqual(ql.ggml_type, qtype.value)
+
+  def test_keep_quantized_gguf_load(self):
+    """gguf_load keeps supported quant types as raw uint8 blocks."""
+    for qtype, bel, bby, sb, so in self._qtypes:
+      with self.subTest(qtype=qtype.name):
+        q_data, rows, cols = self._make_blocks(qtype, bel, bby, sb, so)
+        n_blocks = rows * cols // bel
+        buf = bytearray()
+        buf += struct.pack("<4siqq", b"GGUF", 3, 1, 0)
+        buf += struct.pack("<Q", 6) + b"weight"
+        buf += struct.pack("<I", 2)
+        buf += struct.pack("<QQ", cols, rows)
+        buf += struct.pack("<i", qtype.value)
+        buf += struct.pack("<Q", 0)
+        buf += b"\x00" * ((32 - len(buf) % 32) % 32)
+        buf += q_data.tobytes()
+        _, tensors = gguf_load(Tensor(np.frombuffer(buf, dtype=np.uint8)).to(None))
+        self.assertEqual(tensors["weight"].shape, (n_blocks, bby))
+        self.assertEqual(tensors["weight"].dtype.name, "unsigned char")
 
 if __name__ == '__main__':
   unittest.main()

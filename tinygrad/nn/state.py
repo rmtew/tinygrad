@@ -357,8 +357,14 @@ def gguf_load(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   kv_data, state_dict = nn.state.gguf_load(gguf_tensor)
   ```
 
+  Supported quantized types (Q8_0, Q4_K, Q5_K, Q6_K) are kept as raw uint8 blocks instead of being dequantized.
+
   NOTE: The provided tensor must be on a device that supports execution.
   """
+  # map ggml type to (block_elements, block_bytes) — supported types are kept as raw uint8 blocks
+  _quant_block_info: dict[int, tuple[int, int]] = {2:(32,18), 3:(32,20), 8:(32,34), 12:(256,144), 13:(256,176), 14:(256,210), 39:(32,17)}
+  _keep_quantized = {8, 12, 13, 14}  # Q8_0, Q4_K, Q5_K, Q6_K
+
   reader, kv_data, state_dict = io.BufferedReader(TensorIO(tensor), 1_000_000), {}, {}
   def read_unpack(fmt: str, n: int): return struct.unpack(fmt, reader.read(n))[0]
   def read_str(): return str(reader.read(read_uint64()), "utf-8")
@@ -380,6 +386,11 @@ def gguf_load(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment, pos = kv_data.get("general.alignment", 32), reader.tell()
   data_start = round_up(pos, alignment)
 
-  for name, dims, typ, off in t_infos: state_dict[name] = ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims))
+  for name, dims, typ, off in t_infos:
+    if typ in _keep_quantized and (binfo := _quant_block_info.get(typ)):
+      n_blocks = prod(dims) // binfo[0]
+      state_dict[name] = tensor[data_start + off : data_start + off + n_blocks * binfo[1]].contiguous().reshape(n_blocks, binfo[1])
+    else:
+      state_dict[name] = ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims))
 
   return kv_data, state_dict
