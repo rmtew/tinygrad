@@ -340,7 +340,7 @@ class Transformer:
         else:
           blk.append(TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context,
                                       n_v_heads=n_v_heads, ssm_n_k_heads=n_k_heads, ssm_head_dim=ssm_head_dim, conv_kernel=conv_kernel))
-      remap = lambda k: k.replace('post_attention_norm', 'ffn_norm').replace('ssm_dt.bias', 'ssm_dt').replace('ssm_conv1d.weight', 'ssm_conv1d') \
+      def remap(k): return k.replace('post_attention_norm', 'ffn_norm').replace('ssm_dt.bias', 'ssm_dt').replace('ssm_conv1d.weight', 'ssm_conv1d') \
         .replace('attn_gate', 'ssm_gate')
       state_dict = {remap(k): v for k, v in state_dict.items()}
       quantized = {remap(k): v for k, v in quantized.items()}
