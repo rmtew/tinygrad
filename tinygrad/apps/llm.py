@@ -225,8 +225,10 @@ class TransformerBlock:
     q, k = q.normalize(dim=-1) * (hd ** -0.5), k.normalize(dim=-1)
 
     if n_v_h != n_k_h:
-      q = q.repeat_interleave(n_v_h // n_k_h, dim=1)
-      k = k.repeat_interleave(n_v_h // n_k_h, dim=1)
+      # tiled broadcast to match GGUF's V-head layout (no untiling needed at load time)
+      n_per = n_v_h // n_k_h
+      q = q.unsqueeze(1).expand(B, n_per, n_k_h, hd).reshape(B, n_v_h, hd)
+      k = k.unsqueeze(1).expand(B, n_per, n_k_h, hd).reshape(B, n_v_h, hd)
 
     # gated delta rule recurrence (single token)
     if not hasattr(self, "ssm_state"):
@@ -342,52 +344,6 @@ class Transformer:
         .replace('attn_gate', 'ssm_gate')
       state_dict = {remap(k): v for k, v in state_dict.items()}
       quantized = {remap(k): v for k, v in quantized.items()}
-
-      # GGUF V-head reorder: when n_v != n_k, converter tiles V-heads for ggml broadcast (grouped→tiled).
-      # Undo that here so tinygrad's repeat_interleave (grouped expansion) gets correct head ordering.
-      if n_v_heads != n_k_heads:
-        n_per = n_v_heads // n_k_heads  # heads-per-group
-        hv = ssm_head_dim              # V head dimension
-        def _un_tile(t:Tensor, dim:int, hdim:int) -> Tensor:
-          """Inverse of GGUF _reorder_v_heads: tiled [G0V0,G1V0,G0V1,G1V1] → grouped [G0V0,G0V1,G1V0,G1V1]."""
-          shape = list(t.shape)
-          new_shape = shape[:dim] + [n_per, n_k_heads, hdim] + shape[dim+1:]
-          perm = list(range(len(new_shape)))
-          perm[dim], perm[dim+1] = perm[dim+1], perm[dim]
-          return t.reshape(*new_shape).permute(*perm).contiguous().reshape(*shape)
-        def _un_tile_q_rows(blocks:Tensor, out_f:int, hdim:int) -> Tensor:
-          """Un-tile rows of raw quantized blocks (no dequantization needed). blocks shape: (total_blocks, block_bytes)."""
-          bpr = blocks.shape[0] // out_f  # blocks per row
-          b3 = blocks.reshape(out_f, bpr, blocks.shape[1])
-          return _un_tile(b3, 0, hdim).reshape(-1, blocks.shape[1])
-        key_dim = n_k_heads * hv
-        value_dim = n_v_heads * hv
-        conv_dim = key_dim * 2 + value_dim
-        for i in range(num_blocks):
-          pfx = f'blk.{i}.'
-          if (pfx + 'attn_qkv.weight') not in quantized: continue  # skip full-attention blocks
-          # row permutations on raw quantized blocks (zero extra VRAM)
-          qkv_b = quantized[pfx + 'attn_qkv.weight']
-          bpr = qkv_b.shape[0] // conv_dim
-          b3 = qkv_b.reshape(conv_dim, bpr, qkv_b.shape[1])
-          q_b, k_b, v_b = b3[:key_dim], b3[key_dim:key_dim*2], b3[key_dim*2:]
-          quantized[pfx + 'attn_qkv.weight'] = q_b.cat(k_b, _un_tile(v_b, 0, hv), dim=0).reshape(-1, qkv_b.shape[1])
-          quantized[pfx + 'ssm_gate.weight'] = _un_tile_q_rows(quantized[pfx + 'ssm_gate.weight'], value_dim, hv)
-          quantized[pfx + 'ssm_alpha.weight'] = _un_tile_q_rows(quantized[pfx + 'ssm_alpha.weight'], n_v_heads, 1)
-          quantized[pfx + 'ssm_beta.weight'] = _un_tile_q_rows(quantized[pfx + 'ssm_beta.weight'], n_v_heads, 1)
-          # ssm_out: column permutation requires dequantization
-          out_b = quantized.pop(pfx + 'ssm_out.weight')
-          gt = QuantizedLinear._bytes_to_type[out_b.shape[1]]
-          n_el = out_b.shape[0] * _bel[gt]
-          w = nn.state.ggml_data_to_tensor(out_b.flatten(), n_el, gt).reshape(dim, value_dim).cast('float16')
-          state_dict[pfx + 'ssm_out.weight'] = _un_tile(w, 1, hv)
-          # non-quantized tensors
-          state_dict[pfx + 'ssm_a'] = _un_tile(state_dict[pfx + 'ssm_a'].reshape(n_v_heads, 1), 0, 1).reshape(n_v_heads)
-          state_dict[pfx + 'ssm_dt'] = _un_tile(state_dict[pfx + 'ssm_dt'].reshape(n_v_heads, 1), 0, 1).reshape(n_v_heads)
-          conv1d = state_dict[pfx + 'ssm_conv1d']
-          qk_ch = key_dim * 2
-          state_dict[pfx + 'ssm_conv1d'] = conv1d[:qk_ch].cat(_un_tile(conv1d[qk_ch:], 0, hv), dim=0)
-        if DEBUG >= 1: print(f"un-tiled V-head ordering for {sum(1 for b in blk if b.ssm_gdn)} GatedDeltaNet blocks")
     else:
       blk = None
 
